@@ -1,0 +1,101 @@
+关键：
+1.为了让训练更快，使用不饱和神经元和一个高效的GPU卷积实现
+2.为了减少全连接神经网络的过拟合，使用了最近的"dropout"正则化方法
+
+导论：
+图像训练  需要更大的学习容量  但图像识别巨大的复杂性阻碍了问题的解决
+模型需要具有大量的先验知识去补偿那些我们所没有的数据
+CNN包含了一类这样的模型 它们的性能可以随着CNN的深度和宽度改变，它们可以对图片的本质作出确定而正确的假设
+与标准的前向传播神经网络(相似大小的层)相比，CNN拥有更少的连接和参数故它们更容易训练，同时它们的理论最好表现只是稍微差一点
+CNN应用在高分辨率的图片时可能代价过大而无法使用，幸运的是，GPU和2D卷积的优化能够实现大型CNN的计算 ImageNet数据集包含大量标注数据，训练数据时不会出现严重过拟合。
+论文的网络包含五个卷积层和三个全连接层  这个层数很重要，去掉任意一个卷积层都会导致表现变差
+
+数据集
+ImageNet  top-1 top-5 error rate
+top-5 error rate: 通过模型判断test image最可能的五个label后，test image正确label不在这五个label的图片比例
+ImageNet  图片分辨率不统一，因此先把图片的短边统一为256，然后取图片中心的256*256的部分，输入图像做去均值操作
+训练网络基于像素的(中心)raw RGB值
+
+网络架构
+3.1 ReLU Nonlinearity
+常用激活函数为tanh(x) 或者 1 / (1 + e^(-z))  ---> 存在梯度弥散/消失问题
+梯度下降时ReLU比常用的两个激活函数要更快收敛
+数据量很大的时候传统的神经元模型无法训练庞大的神经网络
+有人提出用|tanh(x)|来替代，它与标准模型对比效率较高(基于Caltech-101 dataset的average pooling)
+在本文的数据集里主要目的是防止过拟合。
+ReLU的优化幅度会随着网络架构的不同而有所不同，但毫无例外都比饱和神经元模型快数倍(同等规模下)
+
+3.2 Training on Multiple GPUs
+GTX580只有3GB显存，这限制了network的规模
+cross-GPU parallelization 允许直接向另一个显存读取或者写入而无需经过主机显存
+在每个GPU上放一半的内核/神经元，同时使用另一个技巧：GPU只在确定的层进行交流
+这种结构比单纯把每个卷积层一半的内核放入GPU训练的结构在top-5 top-1 error rate上分别降低了1.7%和1.2%。
+双GPU比单GPU训练所花的时间更短。
+
+3.3 Local Response Normalization
+ReLU在x较大的时候不会出现梯度弥散/消失的问题。因此ReLU不需要normalization
+local normalization提高模型的泛化能力
+这种normalization实现方式为横向抑制(活跃的神经元对它周围神经元的影响)，这种方式是在真正的神经元中被发现的。为使用不同内核计算的输出的活跃特征创造竞争条件。
+这种normalization可以降低错误率。
+
+3.4 overlapping pooling
+CNN的池化层总结了同一个kernel map中相邻神经元组的输出。
+一个池化层可以想成由间隔为s像素的池化单元网格组成。每一个池化单元网格都可以被归结为相邻的大小为z*z的位于池化单元位置中心的units。
+当s<z的时候，间隔小于池化单元的边长，此时为overlapping pooling.
+overlapping pooling能降低错误率同时保证输出维度相同
+overlapping pooling能让模型更难发生过拟合现象
+
+3.5 Overall Architecture
+我们的网络最大化了多项回归的目标，等同于最大化预测分布下训练样本中正确label的对数概率的平均值。
+第二四五卷积层只连接上一层中存储在相同GPU的那些kernel map。而第三个卷积层则连接第二层中的所有kernel map。
+normalization层跟随在第一二卷积层后
+maxpooling layer跟随在normalization层和第五卷积层后
+RuLU non-linearity应用在每个卷积和全连接层的输出之后
+第三四五卷积层只做卷积，不做任何池化和normalization操作。
+
+不同层的操作
+卷积层：
+第一层: (输入 卷积 ReLU)[convolutional layer] ---> response normalization layer ---> max-pooling layers
+第二层: (卷积 ReLU)(convolutional layer)  ----> response normalization layer ---> max-pooling layer
+第三层: 卷积 ReLU 
+第四层：卷积 ReLU
+第五层：卷积 ReLU max-pooling layer
+全连接层：
+第一层：矩阵乘法  ReLUs  dropout
+第二层：矩阵乘法  ReLUs  dropout
+第三层：矩阵乘法  ReLUs  softmax  输出
+
+计算过程
+输入 论文写的是224 * 224 * 3，但是想得到 55 * 55的output，实际输入应该是 227 * 227 * 3
+接下来将以tensorflow的张量格式表达每一层的参数
+输入 [batch_size, 227, 227, 3]
+第一层：
+卷积核 padding = 0, stride = 4, height = width = 11 96 kernels --->  [11, 11, 3, 96]
+输出  (227 - 11 + 2 * 0) / 4 + 1 = 55 ----> [batch_size, 55, 55, 96]
+经过response normalization后进行max-pooling
+maxpooling: s = 2, z = 3 ==> stride = 2, height = width = 3  ---> [3, 3, 96, 96]
+max-pooling out: (55 - 3 + 2 * 0) / 2 + 1 = 27 ----> [batch_size, 27, 27, 96](通道维度不变)
+第二层：
+卷积核  padding = 2, stride = 1 width = height = 5 --->[5, 5, 96, 256]
+输出  {27 - 5 + 2 * 2} / 1 + 1 = 27  ----> [batch_size, 27, 27, 256]
+max-pooling: s = 2, z = 3  ---> [3, 3, 256, 256]
+out: stride = 2, padding = 0 ---> (27 - 3 + 2 * 0) / 2 + 1 = 13   [batch_size, 13, 13, 256]
+第三层：
+卷积核  [3, 3, 256, 384]
+输出  stride = 1, padding = 1  (13 - 3 + 2 * 1) / 1 + 1 = 13  --->  [batch_size, 13, 13, 384]
+第四层：
+卷积核  [3, 3, 384, 384]
+输出  stride = 1, padding = 1  (13 - 3 + 2 * 1) / 1 + 1 = 13 --> [batch_size, 13, 13, 384]
+第五层：
+卷积核  [3, 3, 384, 256]
+输出  stride = 1, padding = 1  ---> [batch_size, 13, 13, 256]
+max-pooling: [3, 3, 256, 256]
+out: stride = 2 padding = 0 ---> (13 - 3 + 2 * 0) /2 + 1 = 6  --> [batch_size, 6, 6, 256]
+卷积层最终输出 (batch_size * 6 * 6 * 256)
+
+全连接层：
+第一层: 4096个神经元
+第二层：4096个神经元
+第三层：1000个神经元
+
+
